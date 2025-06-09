@@ -7,20 +7,25 @@ import nltk
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import os
+import tempfile
 
 app = Flask(__name__)
 
-# Ensure stopwords are available
-try:
-    stopwords.words('english')
-except LookupError:
-    nltk.download('stopwords')
+# Download NLTK data on first run (for serverless)
+def ensure_nltk_data():
+    try:
+        stopwords.words('english')
+    except LookupError:
+        nltk.download('stopwords', download_dir='/tmp')
+        nltk.data.path.append('/tmp')
 
 # Function to extract text from a PDF resume
 def extract_resume_text(pdf_path):
     try:
         doc = fitz.open(pdf_path)
         text = "\n".join([page.get_text() for page in doc])
+        doc.close()  # Important to close the document
         return text.strip()
     except Exception as e:
         return f"Error reading PDF: {e}"
@@ -28,10 +33,13 @@ def extract_resume_text(pdf_path):
 # Load job data
 def load_jobs(json_file):
     try:
-        with open(json_file, 'r', encoding='utf-8') as file:
+        # For Vercel, the file should be in the same directory
+        file_path = os.path.join(os.path.dirname(__file__), json_file)
+        with open(file_path, 'r', encoding='utf-8') as file:
             data = json.load(file)
         return pd.DataFrame(data)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error loading jobs: {e}")
         return None
 
 # Preprocess job descriptions
@@ -64,11 +72,11 @@ def recommend_jobs(resume_text, job_df, top_n=10, min_sim_threshold=0.15):
     corpus = job_df['processed_description'].tolist()
     corpus.append(processed_resume)
 
+    ensure_nltk_data()
     try:
         stop_words = stopwords.words('english')
     except LookupError:
-        nltk.download('stopwords')
-        stop_words = stopwords.words('english')
+        stop_words = ['i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves']  # Fallback
 
     vectorizer = TfidfVectorizer(stop_words=stop_words)
     tfidf_matrix = vectorizer.fit_transform(corpus)
@@ -107,17 +115,25 @@ def upload_resume():
         else:
             file = request.files["resume"]
             if file.filename.endswith(".pdf"):
-                pdf_path = "./uploaded_resume.pdf"
-                file.save(pdf_path)
+                # Use temporary file for serverless environment
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    file.save(tmp_file.name)
+                    pdf_path = tmp_file.name
 
-                job_df = load_jobs("filtered_jobs.json")
-                resume_text = extract_resume_text(pdf_path)
+                try:
+                    job_df = load_jobs("filtered_jobs.json")
+                    resume_text = extract_resume_text(pdf_path)
 
-                if resume_text:
-                    recommendations, message = recommend_jobs(resume_text, job_df)
-                else:
-                    message = "Error reading resume file."
-
+                    if resume_text and "Error reading PDF" not in resume_text:
+                        recommendations, message = recommend_jobs(resume_text, job_df)
+                    else:
+                        message = "Error reading resume file."
+                finally:
+                    # Clean up temporary file
+                    try:
+                        os.unlink(pdf_path)
+                    except:
+                        pass
             else:
                 message = "Only PDF files are allowed."
 
@@ -126,6 +142,10 @@ def upload_resume():
 @app.route("/about")
 def about():
     return render_template("about.html")
+
+# For Vercel, we need to export the app
+def handler(request):
+    return app(request.environ, lambda *args: None)
 
 if __name__ == "__main__":
     app.run(debug=True)
